@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EKS Cluster with ArgoCD and Bastion Host (Jumpbox)
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC Id
+    Default: "vpc-0b056d2c1bebe29ad"
+
+  SubnetIds:
+    Type: List<String>
+    Description: List of Subnet Ids (min 2 required for EKS)
+    Default: "subnet-07959de568a1093de, subnet-0b0ed52772a141e92, subnet-0d19c90d5d05308f8"
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair for SSH access to Bastion
+    Default: "sur-key"
+
+Resources:
+
+  ### EKS Cluster Role ###
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  ### EKS Cluster ###
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: eks-cluster
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      Version: '1.29'
+      ResourcesVpcConfig:
+        SubnetIds: !Ref SubnetIds
+        EndpointPublicAccess: true
+
+  ### EKS NodeGroup Role ###
+  EKSNodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  ### EKS NodeGroup ###
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodeRole: !GetAtt EKSNodeInstanceRole.Arn
+      Subnets: !Ref SubnetIds
+      ScalingConfig:
+        DesiredSize: 2
+        MaxSize: 3
+        MinSize: 1
+      InstanceTypes:
+        - t3.medium
+      AmiType: AL2_x86_64
+      NodegroupName: eks-ng
+
+  ### Bastion Security Group ###
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 110.33.122.75/32
+
+  ### Bastion Host EC2 Instance ###
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-0deeb71371199f16f # Amazon Linux 2 (region-dependent)
+      KeyName: !Ref KeyName
+      SubnetId: !Select [ 0, !Ref SubnetIds ]
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y curl python3 git
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/kubectl
+          aws eks update-kubeconfig --region ${AWS::Region} --name eks-cluster
+          kubectl create namespace argocd
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+          helm install argocd argo/argo-cd --namespace argocd
+
+  ### IAM Role for Bastion ###
+  BastionInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionInstanceRole
+
+Outputs:
+  ClusterName:
+    Description: EKS Cluster Name
+    Value: !Ref EKSCluster
+
+  BastionPublicIP:
+    Description: Bastion Host Public IP
+    Value: !GetAtt BastionHost.PublicIp
